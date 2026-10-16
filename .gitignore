@@ -21,3 +21,5 @@ tensorboard/
 
 # Generated trajectory data
 trajectory_*.csv
+
+diagnostics/

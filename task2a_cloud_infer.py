@@ -38,6 +38,7 @@ class CloudDQN(object):
         if raw.shape != self.shape or not np.isin(raw, [-1, 0, 100]).all():
             raise ValueError('Unexpected occupancy grid values/shape')
         self.observed = raw >= 0
+        self.raw = np.array(raw, copy=True)
         # Raw cells already describe the object surface: add body radius ONCE.
         self.blocked = dilate_disk(raw == 100, self.body, self.resolution)
 
@@ -77,13 +78,26 @@ class CloudDQN(object):
 
     def known_clear(self, start, target):
         """Known obstacles/static map only; unseen geometry can still collide."""
+        return not self.segment_rejections(start, target)
+
+    def segment_rejections(self, start, target):
+        """Keep all rejection reasons for reproducible runtime diagnosis."""
+        if self.blocked is None:
+            raise ValueError('No cloud grid received')
+        if not np.isfinite([start, target]).all():
+            return ['nonfinite']
         points = np.linspace(start, target,
                              max(2, int(np.ceil(np.linalg.norm(target-start)/.01))+1))
         roi = ((points[:, 0] >= 0) & (points[:, 0] <= 3.2) &
                (points[:, 1] >= 1.2) & (points[:, 1] <= 4.2))
-        return bool(roi.all() and
-                    np.all(self.sample(self.data['clearance'], points, -1.) > self.body) and
-                    not np.any(self.sample(self.blocked, points, True)))
+        reasons = []
+        if not roi.all():
+            reasons.append('roi')
+        if np.any(self.sample(self.data['clearance'], points, -1.) <= self.body):
+            reasons.append('static')
+        if np.any(self.sample(self.blocked, points, True)):
+            reasons.append('pointcloud')
+        return reasons
 
 
 def main():

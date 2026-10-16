@@ -28,6 +28,17 @@ def cloud_xyz(message):
     return points[np.isfinite(points).all(axis=1)]
 
 
+def xyz_cloud(header, points):
+    """Pack XYZ in one array operation instead of Python loops per point."""
+    from sensor_msgs.msg import PointCloud2, PointField
+    packed = np.asarray(points, dtype='<f4').reshape(-1, 3)
+    return PointCloud2(header=header, height=1, width=len(packed),
+        fields=[PointField(name=name, offset=4*i, datatype=PointField.FLOAT32, count=1)
+                for i, name in enumerate(('x', 'y', 'z'))],
+        is_bigendian=False, point_step=12, row_step=12*len(packed),
+        data=packed.tobytes(), is_dense=bool(np.isfinite(packed).all()))
+
+
 def rotation_matrix(quaternion):
     q = np.asarray(quaternion, dtype=float)
     if not np.isfinite(q).all() or np.linalg.norm(q) < 1e-10:
@@ -132,12 +143,14 @@ def main():
     max_height = float(rospy.get_param('~max_height', .35))
     robot_radius = float(rospy.get_param('~robot_radius', .30))
     margin = float(rospy.get_param('~margin', .03))
+    self_filter_radius = float(rospy.get_param('~self_filter_radius', robot_radius+margin))
     min_points = int(rospy.get_param('~min_points_per_cell', 3))
     max_range = float(rospy.get_param('~max_range', 2.5))
     floor_z = float(rospy.get_param('~floor_z', 0.))
     remember = bool(rospy.get_param('~remember_obstacles', True))
     if not (0 < min_height < max_height and robot_radius > 0 and margin >= 0 and
-            min_points >= 1 and max_range > robot_radius+margin):
+            min_points >= 1 and max_range > robot_radius+margin and
+            0 < self_filter_radius <= robot_radius+margin):
         raise ValueError('Invalid point-cloud parameters')
     map_msg = rospy.wait_for_message('/map', OccupancyGrid, timeout=20)
     if map_msg.header.frame_id.lstrip('/') != 'map':
@@ -160,6 +173,7 @@ def main():
 
     rospy.Subscriber(topic, PointCloud2, receive, queue_size=1, buff_size=16*1024*1024)
     cloud_pub = rospy.Publisher('/task2a_cloud/obstacles', PointCloud2, queue_size=1)
+    floor_pub = rospy.Publisher('/task2a_cloud/floor', PointCloud2, queue_size=1)
     raw_pub = rospy.Publisher('/task2a_cloud/occupied', OccupancyGrid, queue_size=1, latch=True)
     blocked_pub = rospy.Publisher('/task2a_cloud/blocked', OccupancyGrid, queue_size=1, latch=True)
     valid_pub = rospy.Publisher('/task2a_cloud/valid', Bool, queue_size=1, latch=True)
@@ -214,7 +228,7 @@ def main():
             robot_xy = np.array([p.x, p.y])
             distance = np.linalg.norm(points[:, :2]-robot_xy, axis=1)
             # Only nearby geometry, excluding the current body footprint.
-            points = points[(distance > robot_radius+margin) & (distance <= max_range)
+            points = points[(distance > self_filter_radius) & (distance <= max_range)
                             & (points[:, 2] > floor_z-.10) & (points[:, 2] < floor_z+.60)]
             normal, offset, residual = fit_floor(points, expected_z=floor_z)
             heights = points @ normal+offset
@@ -241,7 +255,19 @@ def main():
                 # Visualization can be subsampled after map construction.
                 visible_obstacles = visible_obstacles[::max(1, len(visible_obstacles)//30000)]
             header = Header(stamp=stamp, frame_id='map')
-            cloud_pub.publish(point_cloud2.create_cloud_xyz32(header, visible_obstacles.tolist()))
+            # A separate, synchronized floor observation can disprove old surface
+            # locations. Keep one real sample per 5 mm XY cell (not a fake center).
+            if len(floor_points):
+                floor_cells = np.floor(floor_points[:, :2]/.005).astype(np.int64)
+                # Collision-free integer key, including negative coordinates.
+                floor_cells -= floor_cells.min(axis=0)
+                keys = floor_cells[:, 0]*(floor_cells[:, 1].max()+1)+floor_cells[:, 1]
+                _, unique = np.unique(keys, return_index=True)
+                sampled_floor = floor_points[unique]
+            else:
+                sampled_floor = floor_points
+            floor_pub.publish(xyz_cloud(header, sampled_floor))
+            cloud_pub.publish(xyz_cloud(header, visible_obstacles))
             valid_pub.publish(Bool(data=True))
             last_stamp = stamp
             rospy.loginfo_throttle(5.0,
