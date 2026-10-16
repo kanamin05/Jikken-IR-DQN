@@ -1,0 +1,11 @@
+Success rate: 73.0%
+success: 73/100
+obstacle_clearance: 22/100
+static_clearance: 0/100
+roi: 0/100
+mixed: 0/100
+unclassified: 0/100
+timeout: 5/100
+Obstacle rejection episodes (including mixed): 22
+  Hit obstacle known before action: 19
+  Hit obstacle unseen before action: 3

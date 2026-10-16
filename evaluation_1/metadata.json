@@ -1,0 +1,19 @@
+{
+  "model": "/workspace/task2a_dqn_starter/task2a_dqn_2_obstacles_6000steps.zip",
+  "model_sha256": "881147a3d971e13bff079a13cd01e019a0fbd19aa3d0553e865fa1c369661344",
+  "obstacle_count": 2,
+  "episodes": 100,
+  "seed_start": 10000,
+  "robot_radius": 0.3,
+  "margin": 0.03,
+  "step_size": 0.15,
+  "max_steps": 150,
+  "radii_by_label": {
+    "foam_brick": 0.08,
+    "lego_duplo": 0.19
+  },
+  "environment_sha256": "4e67cb8552bdde801e7f2f22502f7f4d49a4e40df2c8a62f83f96ec7a1eff4dd",
+  "map_yaml_sha256": "5cded258e6131033c811ca6defb5fe4991918d486f9b85b63a11c3a16e578f3c",
+  "map_pgm_sha256": "d2017ab6ec7b09b32425bfbabc546fb2a02eeb078b24916e33ee39ee0f3673dc",
+  "note": "Rejected-clearance violations are not necessarily physical contacts. Classification mirrors ROI and radius rules of the supplied environment."
+}
