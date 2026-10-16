@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# DQN trained models
+checkpoints*/
+task2a_dqn*.zip
+
+# Training logs
+*.log
+logs/
+runs/
+tensorboard/
+*.tfevents.*
+
+# Temporary files
+.DS_Store
+
+# Generated trajectory data
+trajectory_*.csv
