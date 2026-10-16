@@ -1,0 +1,13 @@
+<launch>
+  <arg name="dry_run" default="true" />
+  <arg name="weights" default="/home/developer/workspace/task2a_dqn_starter/task2a_policy_numpy.npz" />
+  <node pkg="wrs_algorithm" type="wrs_main_node.py" name="wrs_main" output="screen" required="true">
+    <param name="test_mode" value="false" />
+    <param name="task2a_dqn_enabled" value="true" />
+    <param name="task2a_dqn_dry_run" value="$(arg dry_run)" />
+    <param name="task2a_dqn_weights" value="$(arg weights)" />
+    <param name="task2a_dqn_safety_filter" value="true" />
+    <param name="task2a_dqn_move_timeout" value="20.0" />
+    <param name="task2a_dqn_floor_max_z" value="0.20" />
+  </node>
+</launch>

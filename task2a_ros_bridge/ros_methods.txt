@@ -1,0 +1,305 @@
+    # ===== Kanami: Task2a DQN ROS bridge START =====
+    def task2a_dqn_load(self):
+        import numpy as np
+        from nav_msgs.msg import OccupancyGrid
+        path = rospy.get_param("~task2a_dqn_weights")
+        with np.load(os.path.expanduser(path), allow_pickle=False) as archive:
+            data = {key: archive[key].copy() for key in archive.files}
+        if int(data["version"]) != 1:
+            raise ValueError("Unsupported DQN export version")
+        self._tdqn = data
+        self._tdqn_obstacles = []
+        self._tdqn_radii = dict(zip(data["labels"].tolist(), data["radii"].tolist()))
+        self._tdqn_pub = None
+        # Require the live static map to match the training map.
+        msg = rospy.wait_for_message("/map", OccupancyGrid, timeout=15)
+        values = np.array(msg.data).reshape(msg.info.height, msg.info.width)
+        live_free = (values >= 0) & (values <= 19)
+        q = msg.info.origin.orientation
+        if not (abs(q.x) < 1e-6 and abs(q.y) < 1e-6 and abs(q.z) < 1e-6
+                and abs(abs(q.w)-1) < 1e-6):
+            raise ValueError("Map rotation differs from training")
+        if (msg.header.frame_id.lstrip("/") != "map" or
+                live_free.shape != data["free"].shape or
+                not np.array_equal(live_free, data["free"]) or
+                abs(msg.info.resolution-float(data["resolution"])) > 1e-6 or
+                not np.allclose([msg.info.origin.position.x, msg.info.origin.position.y],
+                                data["origin"], atol=1e-6)):
+            raise ValueError("Live /map differs from training map; do not run this policy")
+        rospy.loginfo("DQN loaded: robot=%.3f margin=%.3f, radii=%s",
+                      float(data["robot_radius"]), float(data["margin"]), self._tdqn_radii)
+
+    def task2a_dqn_clearance(self, point):
+        import numpy as np
+        data = self._tdqn
+        x, y = np.floor((np.asarray(point)-data["origin"])/float(data["resolution"])).astype(int)
+        grid = data["clearance"]
+        if x < 0 or y < 0 or y >= grid.shape[0] or x >= grid.shape[1]:
+            return -1.0
+        return float(grid[y, x])
+
+    def task2a_dqn_pose(self):
+        import numpy as np
+        frame = rospy.get_param("~task2a_dqn_base_frame", "base_footprint")
+        transform = self.tf_buffer.lookup_transform(
+            "map", frame, rospy.Time(0), rospy.Duration(3.0)).transform
+        p, q = transform.translation, transform.rotation
+        yaw = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
+        return np.array([p.x, p.y]), yaw
+
+    def task2a_dqn_detect(self):
+        import numpy as np
+        result = self.get_latest_detection()
+        max_height = float(rospy.get_param("~task2a_dqn_floor_max_z", 0.20))
+        for bbox in result.bboxes:
+            label = str(bbox.label)
+            if label not in self._tdqn_radii:
+                # Fail on unexpected detections rather than silently driving through them.
+                raise ValueError("Unsupported detection label: %s" % label)
+            point = self.get_grasp_coordinate(bbox)
+            if point is None or not np.isfinite([point.x, point.y, point.z]).all():
+                raise ValueError("Invalid detection coordinate")
+            if point.z < -0.05 or point.z > max_height:
+                raise ValueError("Detection is not near floor: %s z=%.3f" % (label, point.z))
+            center = np.array([point.x, point.y])
+            radius = float(self._tdqn_radii[label])
+            # Static obstacles: retain conservative union of observed positions.
+            # Do not infer object identity from detection order.
+            duplicate = any(old[2] == label and np.linalg.norm(old[0]-center) < .02
+                            for old in self._tdqn_obstacles)
+            if not duplicate:
+                self._tdqn_obstacles.append((center, radius, label))
+            rospy.loginfo("DQN obstacle: %s map=(%.3f,%.3f,%.3f) radius=%.3f",
+                          label, point.x, point.y, point.z, radius)
+        if len(self._tdqn_obstacles) > 100:
+            raise ValueError("Unstable detections: obstacle memory exceeds 100 entries")
+
+    def task2a_dqn_observation(self, position):
+        import numpy as np
+        data = self._tdqn
+        axis = (np.arange(30)-14.5)*.10
+        dx, dy = np.meshgrid(axis, axis)
+        points = position + np.stack([dx, dy], axis=-1)
+        body = float(data["robot_radius"])+float(data["margin"])
+        static = np.array([self.task2a_dqn_clearance(p) <= body
+                           for p in points.reshape(-1, 2)]).reshape(30, 30)
+        dynamic = np.zeros((30, 30), dtype=float)
+        for center, radius, _ in self._tdqn_obstacles:
+            dynamic = np.maximum(dynamic, np.linalg.norm(points-center, axis=-1) <= body+radius)
+        # Same approximate view-coverage channel as the training environment.
+        seen = ((dy > 0) & (np.hypot(dx, dy) <= 1.5) &
+                (np.abs(np.arctan2(dx, dy)) <= np.deg2rad(50)))
+        for row, col in zip(*np.where(seen)):
+            ray = np.linspace(position, points[row, col], 30)
+            if any(self.task2a_dqn_clearance(p) < 0 for p in ray):
+                seen[row, col] = False
+        obs = np.concatenate([static.ravel(), dynamic.ravel(), seen.ravel(),
+                              np.clip((data["goal"]-position)/3., -1, 1)]).astype(np.float32)
+        if obs.shape != (2702,) or not np.isfinite(obs).all():
+            raise ValueError("Invalid DQN observation")
+        return obs
+
+    def task2a_dqn_qvalues(self, observation):
+        import numpy as np
+        data = self._tdqn
+        x = observation.astype(np.float32)
+        count = int(data["n_layers"])
+        for i in range(count):
+            x = np.dot(x, data["w%d" % i].T)+data["b%d" % i]
+            if i < count-1:
+                x = np.maximum(x, 0)
+        if x.shape != (8,) or not np.isfinite(x).all():
+            raise ValueError("Invalid DQN Q-values")
+        return x
+
+    def task2a_dqn_segment_valid(self, start, target):
+        import numpy as np
+        data = self._tdqn
+        body = float(data["robot_radius"])+float(data["margin"])
+        count = max(2, int(np.ceil(np.linalg.norm(target-start)/.01))+1)
+        for point in np.linspace(start, target, count):
+            if not (0 <= point[0] <= 3.2 and 1.2 <= point[1] <= 4.2):
+                return False
+            if self.task2a_dqn_clearance(point) <= body:
+                return False
+            for center, radius, _ in self._tdqn_obstacles:
+                if np.linalg.norm(point-center) <= body+radius:
+                    return False
+        return True
+
+    def task2a_dqn_markers(self, position, target):
+        from visualization_msgs.msg import Marker, MarkerArray
+        from geometry_msgs.msg import Point
+        if self._tdqn_pub is None:
+            self._tdqn_pub = rospy.Publisher("/task2a_dqn/markers", MarkerArray,
+                                               queue_size=1, latch=True)
+        markers = []
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        markers.append(clear)
+        body = float(self._tdqn["robot_radius"])+float(self._tdqn["margin"])
+        for index, (center, radius, label) in enumerate(self._tdqn_obstacles):
+            for outer in (False, True):
+                marker = Marker()
+                marker.header.frame_id = "map"
+                marker.header.stamp = rospy.Time.now()
+                marker.ns = "exclusion" if outer else "obstacle"
+                marker.id = index
+                marker.type = Marker.CYLINDER
+                marker.action = Marker.ADD
+                marker.pose.position.x, marker.pose.position.y = float(center[0]), float(center[1])
+                marker.pose.position.z = .02 if outer else .05
+                marker.pose.orientation.w = 1
+                r = radius+body if outer else radius
+                marker.scale.x = marker.scale.y = 2*r
+                marker.scale.z = .01 if outer else .05
+                marker.color.r = 1
+                marker.color.a = .12 if outer else .7
+                markers.append(marker)
+        robot = Marker()
+        robot.header.frame_id = "map"
+        robot.ns = "robot_footprint"
+        robot.id = 0
+        robot.type = Marker.CYLINDER
+        robot.pose.position.x, robot.pose.position.y = float(position[0]), float(position[1])
+        robot.pose.orientation.w = 1
+        robot.scale.x = robot.scale.y = 2*float(self._tdqn["robot_radius"])
+        robot.scale.z = .02
+        robot.color.b, robot.color.a = 1., .3
+        markers.append(robot)
+        arrow = Marker()
+        arrow.header.frame_id = "map"
+        arrow.ns = "selected_action"
+        arrow.id = 0
+        arrow.type = Marker.ARROW
+        arrow.pose.orientation.w = 1
+        arrow.scale.x, arrow.scale.y, arrow.scale.z = .025, .05, .07
+        arrow.color.g, arrow.color.a = 1., 1.
+        arrow.points = [Point(x=float(position[0]), y=float(position[1]), z=.15),
+                        Point(x=float(target[0]), y=float(target[1]), z=.15)]
+        markers.append(arrow)
+        self._tdqn_pub.publish(MarkerArray(markers=markers))
+
+    def task2a_dqn_move(self, target):
+        import numpy as np
+        from nav_msgs.srv import GetPlan, GetPlanRequest
+        from geometry_msgs.msg import PoseStamped
+        from move_base_msgs.msg import MoveBaseGoal
+        from actionlib_msgs.msg import GoalStatus
+        client = omni_base.NAVCLIENT
+        if not client.wait_for_server(rospy.Duration(5)):
+            raise RuntimeError("move_base action server unavailable")
+        position, _ = self.task2a_dqn_pose()
+        start = PoseStamped()
+        start.header.frame_id = "map"
+        start.header.stamp = rospy.Time.now()
+        start.pose.position.x, start.pose.position.y = float(position[0]), float(position[1])
+        start.pose.orientation.z = start.pose.orientation.w = math.sqrt(.5)
+        goal = PoseStamped()
+        goal.header.frame_id = "map"
+        goal.header.stamp = rospy.Time.now()
+        goal.pose.position.x, goal.pose.position.y = float(target[0]), float(target[1])
+        goal.pose.orientation.z = goal.pose.orientation.w = math.sqrt(.5)
+        service = "/move_base/make_plan"
+        rospy.wait_for_service(service, timeout=5)
+        response = rospy.ServiceProxy(service, GetPlan)(GetPlanRequest(start=start, goal=goal, tolerance=0.0))
+        if response.plan.header.frame_id.lstrip("/") != "map" or not response.plan.poses:
+            raise RuntimeError("No usable move_base plan")
+        previous = position
+        for pose in response.plan.poses:
+            p = np.array([pose.pose.position.x, pose.pose.position.y])
+            if not self.task2a_dqn_segment_valid(previous, p):
+                raise RuntimeError("move_base plan enters known exclusion area")
+            previous = p
+        if not self.task2a_dqn_segment_valid(previous, target):
+            raise RuntimeError("move_base final plan segment is blocked")
+        message = MoveBaseGoal()
+        message.target_pose = goal
+        client.send_goal(message)
+        limit = float(rospy.get_param("~task2a_dqn_move_timeout", 20.0))
+        import time
+        deadline = time.monotonic()+limit
+        while not rospy.is_shutdown():
+            if time.monotonic() > deadline:
+                client.cancel_goal()
+                return False
+            if client.wait_for_result(rospy.Duration(.10)):
+                current, _ = self.task2a_dqn_pose()
+                return (client.get_state() == GoalStatus.SUCCEEDED and
+                        np.linalg.norm(current-target) <= .10)
+            current, _ = self.task2a_dqn_pose()
+            if not self.task2a_dqn_segment_valid(current, current):
+                client.cancel_goal()
+                return False
+        client.cancel_goal()
+        return False
+
+    def task2a_dqn_run(self):
+        import numpy as np
+        dry_run = bool(rospy.get_param("~task2a_dqn_dry_run", True))
+        rospy.loginfo("Kanami Task2a DQN: dry_run=%s", dry_run)
+        try:
+            self.task2a_dqn_load()
+            if not dry_run:
+                self.change_pose("look_at_near_floor")
+                gripper.command(0)
+                if not self.goto_name("standby_2a"):
+                    raise RuntimeError("Cannot reach standby_2a")
+            repeats = []
+            for step in range(150):
+                if rospy.is_shutdown():
+                    return False
+                self.task2a_dqn_detect()
+                position, yaw = self.task2a_dqn_pose()
+                if not np.isfinite(position).all():
+                    raise ValueError("Invalid robot pose")
+                if np.linalg.norm(position-self._tdqn["goal"]) <= .12:
+                    rospy.loginfo("DQN reached goal")
+                    return True
+                if abs(math.atan2(math.sin(yaw-math.pi/2), math.cos(yaw-math.pi/2))) > math.radians(15):
+                    raise ValueError("Robot yaw must be near +90 deg, as in training")
+                if not self._tdqn_obstacles:
+                    raise ValueError("No floor obstacles detected; reobserve before moving")
+                observation = self.task2a_dqn_observation(position)
+                values = self.task2a_dqn_qvalues(observation)
+                raw_action = int(values.argmax())
+                raw_target = position+self._tdqn["actions"][raw_action]*float(self._tdqn["step_size"])
+                selected = raw_action
+                # Separate run-time guard. Log interventions; do not call this pure-DQN performance.
+                if bool(rospy.get_param("~task2a_dqn_safety_filter", True)):
+                    selected = None
+                    for candidate in np.argsort(-values):
+                        target = position+self._tdqn["actions"][candidate]*float(self._tdqn["step_size"])
+                        if self.task2a_dqn_segment_valid(position, target):
+                            selected = int(candidate)
+                            break
+                    if selected is None:
+                        raise RuntimeError("All eight local actions are blocked")
+                target = position+self._tdqn["actions"][selected]*float(self._tdqn["step_size"])
+                self.task2a_dqn_markers(position, target)
+                rospy.loginfo("DQN step=%d position=%s raw=%d selected=%d target=%s Q=%s",
+                              step, position, raw_action, selected, target, values)
+                if selected != raw_action:
+                    rospy.logwarn("DQN safety filter intervened")
+                if not self.task2a_dqn_segment_valid(position, target):
+                    raise RuntimeError("Selected DQN segment is blocked")
+                if dry_run:
+                    rospy.loginfo("DRY RUN: no motion sent. RViz MarkerArray: /task2a_dqn/markers")
+                    # Keep markers available while the existing launch requires this node.
+                    rospy.spin()
+                    return True
+                if not self.task2a_dqn_move(target):
+                    raise RuntimeError("Move failed, deviated, or timed out")
+                current, _ = self.task2a_dqn_pose()
+                repeats.append(tuple(np.round(current/.05).astype(int)))
+                if len(repeats) >= 12 and len(set(repeats[-12:])) <= 3:
+                    raise RuntimeError("Repeated local loop; Task2a stopped")
+            raise RuntimeError("Task2a step limit reached")
+        except Exception as error:
+            rospy.logerr("Task2a DQN stopped: %s", error)
+            return False
+        finally:
+            if not dry_run:
+                omni_base.NAVCLIENT.cancel_goal()
+                omni_base.cmd_vel(0, 0, 0)
+    # ===== Kanami: Task2a DQN ROS bridge END =====
