@@ -20,6 +20,25 @@ class LocalizationChanged(RuntimeError):
     """A local motion must stop and be replanned after a map-frame correction."""
 
 
+class SegmentBlocked(RuntimeError):
+    """Fresh geometry invalidated the segment; stop before any new plan."""
+
+
+class StepStalled(RuntimeError):
+    """Some progress was made, but the short target needs to be replanned."""
+
+
+class ProgressWatchdog:
+    """Detect millimetre-scale nonconvergence without declaring goal success."""
+    def __init__(self, now, distance, seconds=2.):
+        self.best, self.since, self.seconds = distance, now, seconds
+
+    def stalled(self, now, distance):
+        if distance < self.best-.001:
+            self.best, self.since = distance, now
+        return now-self.since >= self.seconds
+
+
 def validate_map(policy, msg, check_static=False):
     q = msg.info.origin.orientation
     if (msg.header.frame_id.lstrip('/') != 'map' or
@@ -52,22 +71,24 @@ def check_path(policy, start, target, path, max_length):
 
 
 def velocity_command(position, target, map_yaw, odom_yaw, reference_odom_yaw,
-                     tolerance=.03, min_speed=0., heading_gain=1.2):
+                     tolerance=.03, min_speed=0., heading_gain=1.2,
+                     max_speed=.05, heading_deadband=0., max_angular_speed=.15):
     """Map-frame position feedback; odom-frame heading feedback. SI units."""
     difference = np.asarray(target)-np.asarray(position)
     angle = math.atan2(math.sin(reference_odom_yaw-odom_yaw),
                        math.cos(reference_odom_yaw-odom_yaw))
     velocity = difference*.7
     norm = np.linalg.norm(velocity)
-    if norm > .05:
-        velocity *= .05/norm
+    if norm > max_speed:
+        velocity *= max_speed/norm
     elif 0 < norm < min_speed:
         velocity *= min_speed/norm
     if np.linalg.norm(difference) <= tolerance or abs(angle) > .08:
         velocity[:] = 0.
     c, s = math.cos(map_yaw), math.sin(map_yaw)
     body = np.array([c*velocity[0]+s*velocity[1], -s*velocity[0]+c*velocity[1]])
-    return body, float(np.clip(angle*heading_gain, -.15, .15)), angle
+    angular = 0. if abs(angle) <= heading_deadband else angle*heading_gain
+    return body, float(np.clip(angular, -max_angular_speed, max_angular_speed)), angle
 
 
 def execute_velocity_step(args, policy, start, target, update_cloud, pose):
@@ -106,7 +127,10 @@ def execute_velocity_step(args, policy, start, target, update_cloud, pose):
                             math.radians(policy.pose_diagnostic['yaw_odom_deg']))
         args.velocity_reference_odom = reference
         starting_diagnostic = dict(policy.pose_diagnostic)
-        rospy.loginfo('VELOCITY STEP: heading feedback enabled; speed <=0.05 m/s, correction <=0.15 rad/s.')
+        initial_distance = float(np.linalg.norm(current-target))
+        watchdog = ProgressWatchdog(time.monotonic(), initial_distance)
+        rospy.loginfo('VELOCITY STEP: speed <=%.3f m/s, correction <=%.3f rad/s.',
+            getattr(args, 'max_speed', .05), getattr(args, 'max_angular_speed', .15))
         while not rospy.is_shutdown():
             if active[0]:
                 raise RuntimeError('Another move_base goal became active')
@@ -128,13 +152,15 @@ def execute_velocity_step(args, policy, start, target, update_cloud, pose):
                 raise RuntimeError('Odom heading unavailable during motion')
             odom_yaw = math.radians(diagnostic['yaw_odom_deg'])
             if not policy.known_clear(current, target):
-                raise RuntimeError('Updated cloud blocks velocity-step segment')
+                raise SegmentBlocked('Updated cloud blocks velocity-step segment')
             if np.linalg.norm(current-start) > float(policy.data['step_size'])+.1:
                 raise RuntimeError('Robot left the one-step area: start=%s current=%s diagnostic=%s' %
                                    (start, current, diagnostic))
             body, angular, error = velocity_command(current, target, map_yaw,
                 odom_yaw, reference, args.target_tolerance,
-                getattr(args, 'min_speed', 0.), getattr(args, 'heading_gain', 1.2))
+                getattr(args, 'min_speed', 0.), getattr(args, 'heading_gain', 1.2),
+                getattr(args, 'max_speed', .05), getattr(args, 'heading_deadband', 0.),
+                getattr(args, 'max_angular_speed', .15))
             if abs(error) > math.radians(15):
                 raise RuntimeError('Odom heading drift exceeded 15 degrees despite correction')
             training_error = math.atan2(math.sin(map_yaw-math.pi/2), math.cos(map_yaw-math.pi/2))
@@ -152,13 +178,25 @@ def execute_velocity_step(args, policy, start, target, update_cloud, pose):
             angular = float(np.clip(angular, previous_angular-.3*dt, previous_angular+.3*dt))
             previous_linear, previous_angular = body, angular
             distance = float(np.linalg.norm(current-target))
-            if distance <= args.target_tolerance and abs(error) <= math.radians(2):
+            if (getattr(args, 'replan_stalled_steps', False) and
+                    watchdog.stalled(time.monotonic(), distance) and distance > args.target_tolerance):
+                progress = initial_distance-distance
+                if progress >= .01:
+                    raise StepStalled('Partial step: progress=%.3f m, remaining=%.3f m; stop and replan' %
+                                      (progress, distance))
+                raise RuntimeError('Velocity step made no progress for 2 seconds: remaining=%.3f m' % distance)
+            if distance <= args.target_tolerance and (
+                    getattr(args, 'settle_without_rotation', False) or abs(error) <= math.radians(2)):
                 if settled is None:
                     settled = time.monotonic()
                 # Stop linear movement immediately once both criteria are met.
                 body = np.zeros(2)
                 previous_linear = body
-                if time.monotonic()-settled >= .3:
+                if getattr(args, 'settle_without_rotation', False):
+                    # TASK2A tracking fix: residual angular velocity moved the
+                    # base after reporting millimetre-level target completion.
+                    angular = previous_angular = 0.
+                if time.monotonic()-settled >= getattr(args, 'settle_seconds', .3):
                     rospy.loginfo('ONE STEP COMPLETE: final=%s displacement=%.3f m target_error=%.3f m heading_error=%.2f deg.',
                                   current, np.linalg.norm(current-start), distance, math.degrees(error))
                     return True
@@ -218,6 +256,7 @@ def create_session(args, policy_factory=CloudDQN):
     cloud_sub = rospy.Subscriber('/task2a_cloud/occupied', OccupancyGrid, receive, queue_size=1)
     valid_sub = rospy.Subscriber('/task2a_cloud/valid', Bool, receive_valid, queue_size=1)
     command_sub = rospy.Subscriber('/hsrb/command_velocity', Twist, receive_command, queue_size=50)
+    last_coarse = [None]
 
     def update_cloud():
         msg, received = latest[:]
@@ -228,7 +267,12 @@ def create_session(args, policy_factory=CloudDQN):
         age = (rospy.Time.now()-msg.header.stamp).to_sec()
         if msg.header.stamp == rospy.Time(0) or age < -.5 or age > 3:
             raise ValueError('Point-cloud map stale: age=%.2f s' % age)
-        policy.update(validate_map(policy, msg))
+        # TASK2A tracking fix: validate liveness every cycle, but only rasterize
+        # a coarse message once. Precise geometry has its own independent guard.
+        key = (msg.header.stamp.to_nsec(), msg.header.seq)
+        if key != last_coarse[0]:
+            policy.update(validate_map(policy, msg))
+            last_coarse[0] = key
         return msg.header.stamp
 
     def pose():

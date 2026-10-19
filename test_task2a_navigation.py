@@ -6,8 +6,8 @@ import numpy as np
 from scipy.spatial import cKDTree
 from task2a_cloud_infer import CloudDQN
 from task2a_route_guard import RouteGuard
-from task2a_precise_run import PreciseDQN, clear_observed_floor
-from task2a_cloud_step import run_steps, velocity_command
+from task2a_precise_run import PreciseDQN, clear_observed_floor, widest_free_grid, validate_resume_scene
+from task2a_cloud_step import run_steps, velocity_command, execute_velocity_step, ProgressWatchdog
 from task2a_handoff import handoff_reason
 
 
@@ -24,6 +24,169 @@ def policy(cls=CloudDQN):
 
 
 class NavigationTests(unittest.TestCase):
+    def test_lookahead_retreats_before_greedy_approach_gets_trapped(self):
+        # Reduced geometry from the stopped run: goal lies beyond the upper
+        # left obstacle. The first step must be allowed to move away from goal.
+        p = policy(PreciseDQN)
+        p.data['goal'] = np.array([2., 3.5])
+        p.tree = cKDTree([[2.39, 2.56], [2.96, 2.50]])
+        start = np.array([2.514, 2.336])
+        target, info = p.choose_local_finish(start, [])
+        self.assertLess(info['progress'], 0.)
+        self.assertLess(target[1], start[1])
+        self.assertGreater(p.tree.query(target)[0], p.tree.query(start)[0]+.02)
+        self.assertTrue(p.known_clear(start, target))
+        self.assertLessEqual(np.linalg.norm(target-start), .05)
+
+    def test_timeout_log_commands_restore_previously_working_speed(self):
+        # Regression: remaining 13 mm, heading error 3.2 deg previously produced
+        # only ~0.008 m/s and 0.056 rad/s, with almost no measured progress.
+        body, angular, _ = velocity_command([0., 0.], [0., .013], np.pi/2,
+            -np.deg2rad(3.2), 0., tolerance=.005, min_speed=.02,
+            heading_gain=3., max_speed=.03, heading_deadband=np.deg2rad(2),
+            max_angular_speed=.15)
+        self.assertAlmostEqual(np.linalg.norm(body), .02)
+        self.assertAlmostEqual(angular, .15)
+
+    def test_stall_watchdog_ignores_submillimetre_noise_and_resets_on_progress(self):
+        watch = ProgressWatchdog(0., .15)
+        self.assertFalse(watch.stalled(1., .013))
+        self.assertFalse(watch.stalled(2.8, .0125))
+        self.assertTrue(watch.stalled(3.1, .0125))
+        self.assertFalse(watch.stalled(3.2, .010))
+        self.assertFalse(watch.stalled(4., .0095))
+
+    def test_local_finish_can_move_without_complete_route(self):
+        p = policy(PreciseDQN)
+        p.tree = cKDTree([[3., 4.]])
+        p.data['clearance'][26, :] = 0.  # Disconnect the goal beyond a wall.
+        start = np.array([1.5, 2.])
+        with self.assertRaises(ValueError):
+            p.plan(start)
+        with patch.object(p, 'qvalues', side_effect=AssertionError('DQN called')):
+            target, info = p.choose_local_finish(start, [])
+        self.assertFalse(info['requires_complete_route'])
+        self.assertLessEqual(np.linalg.norm(target-start), .05+1e-9)
+        self.assertTrue(p.known_clear(start, target))
+
+    def test_local_finish_still_refuses_contact_and_repeated_targets(self):
+        p = policy(PreciseDQN); start = np.array([1.5, 2.])
+        p.tree = cKDTree([start])
+        with self.assertRaises(ValueError):
+            p.choose_local_finish(start, [])
+        p.tree = cKDTree([[3., 4.]])
+        visited = [start+direction*distance for direction in p.data['actions']
+                   for distance in (.05, .025, .015)]
+        target, info = p.choose_local_finish(start, visited)
+        self.assertTrue(all(np.linalg.norm(target-old) >= .012 for old in visited))
+        self.assertTrue(p.known_clear(start, target))
+        self.assertEqual(info['mode'], 'local_guarded_detour')
+
+    def test_precise_waypoint_settles_with_zero_rotation(self):
+        clock, commands = [0.], []
+        handle = types.SimpleNamespace(unregister=lambda: None)
+        def twist():
+            return types.SimpleNamespace(linear=types.SimpleNamespace(x=0., y=0., z=0.),
+                angular=types.SimpleNamespace(x=0., y=0., z=0.))
+        publisher = types.SimpleNamespace(get_num_connections=lambda: 1,
+            publish=lambda c: commands.append((c.linear.x, c.linear.y, c.angular.z)),
+            unregister=lambda: None)
+        rospy = types.SimpleNamespace(is_shutdown=lambda: False,
+            wait_for_message=lambda *a, **k: types.SimpleNamespace(status_list=[]),
+            Subscriber=lambda *a, **k: handle, Publisher=lambda *a, **k: publisher,
+            loginfo=lambda *a: None, loginfo_throttle=lambda *a: None,
+            Time=types.SimpleNamespace(now=lambda: types.SimpleNamespace(to_sec=lambda: clock[0])))
+        status = types.SimpleNamespace(PENDING=0, ACTIVE=1, PREEMPTING=6, RECALLING=7)
+        modules = {'rospy': rospy, 'geometry_msgs.msg': types.SimpleNamespace(Twist=twist),
+            'actionlib_msgs.msg': types.SimpleNamespace(GoalStatusArray=object, GoalStatus=status)}
+        args = types.SimpleNamespace(timeout=5., target_tolerance=.005,
+            velocity_reference_odom=0., settle_without_rotation=True, settle_seconds=.6)
+        p = types.SimpleNamespace(pose_diagnostic=dict(yaw_odom_deg=np.rad2deg(.07)),
+            known_clear=lambda *a: True, data=dict(step_size=.15))
+        def sleep(seconds): clock[0] += seconds
+        with patch.dict(sys.modules, modules), patch('task2a_cloud_step.time.monotonic',
+                side_effect=lambda: clock[0]), patch('task2a_cloud_step.time.sleep', side_effect=sleep):
+            self.assertTrue(execute_velocity_step(args, p, np.zeros(2), np.zeros(2),
+                lambda: None, lambda: (np.zeros(2), np.pi/2)))
+        self.assertGreaterEqual(clock[0], .6)
+        self.assertGreater(len(commands), 6)
+        self.assertTrue(all(c == (0., 0., 0.) for c in commands))
+
+    def test_resume_refuses_reset_or_changed_localization(self):
+        saved = dict(xy_map=[2.5, 2.4], map_odom_xy=[.1, .1],
+                     yaw_map_odom_deg=3., tf_stamp=100.)
+        validate_resume_scene(saved, saved, 101.)
+        for current, now in [(saved, 99.), (dict(saved, xy_map=[0., 0.]), 101.),
+                             (dict(saved, map_odom_xy=[.2, .1]), 101.),
+                             (dict(saved, yaw_map_odom_deg=8.), 101.)]:
+            with self.assertRaises(ValueError):
+                validate_resume_scene(current, saved, now)
+
+    def test_widest_route_chooses_roomier_corridor(self):
+        distances = np.zeros((7, 9))
+        distances[1, 1:8] = .254
+        distances[5, 1:8] = .259
+        distances[1:6, 1] = distances[1:6, 7] = .28
+        goals = np.zeros_like(distances, dtype=bool); goals[3, 7] = True
+        free, threshold = widest_free_grid(distances, np.ones_like(goals),
+                                           (3, 1), goals, .252, .262)
+        self.assertGreater(threshold, .258)
+        self.assertFalse(free[1, 4])
+        self.assertTrue(free[5, 4])
+        distances[5, 4] = distances[1, 4] = .251
+        free, _ = widest_free_grid(distances, np.ones_like(goals),
+                                  (3, 1), goals, .252, .262)
+        self.assertIsNone(free)
+
+    def test_quiet_heading_feedback_and_lower_speed_limits(self):
+        body, angular, _ = velocity_command([0., 0.], [0., 1.], 0., .02, 0.,
+            max_speed=.03, heading_deadband=np.deg2rad(2), max_angular_speed=.06)
+        self.assertAlmostEqual(np.linalg.norm(body), .03)
+        self.assertEqual(angular, 0.)
+        _, angular, _ = velocity_command([0., 0.], [0., 1.], 0., .07, 0.,
+            heading_gain=3., max_angular_speed=.06)
+        self.assertAlmostEqual(angular, -.06)
+
+    def test_geometry_cache_still_checks_freshness_and_reprojects_tf(self):
+        class Stamp:
+            def __init__(self, value): self.value = value
+            def to_sec(self): return self.value
+            def to_nsec(self): return int(self.value*1e9)
+            def __sub__(self, other): return Stamp(self.value-other.value)
+        p = policy(PreciseDQN)
+        p.tree, p.memory = None, set()
+        p.processed_stamp = p.processed_floor_stamp = p.geometry_key = None
+        p.cleared_surface_voxels = 0
+        p.observed = np.ones(p.shape, dtype=bool)
+        tr = types.SimpleNamespace(x=0., y=0., z=0.)
+        q = types.SimpleNamespace(x=0., y=0., z=0., w=1.)
+        p.tf_buffer = types.SimpleNamespace(lookup_transform=lambda *a:
+            types.SimpleNamespace(transform=types.SimpleNamespace(rotation=q, translation=tr)))
+        msg = types.SimpleNamespace(header=types.SimpleNamespace(stamp=Stamp(10), frame_id='map'))
+        now = [10.]
+        rospy = types.SimpleNamespace(Time=types.SimpleNamespace(now=lambda: Stamp(now[0])),
+                                      Duration=lambda seconds: seconds)
+        # lookup_transform also uses rospy.Time(0).
+        class Clock:
+            def __new__(cls, seconds): return Stamp(seconds)
+            @staticmethod
+            def now(): return Stamp(now[0])
+        rospy.Time = Clock
+        with patch.dict(sys.modules, rospy=rospy), patch('task2a_precise_run.cloud_xyz',
+                return_value=np.array([[1.5, 2.5, .1]])):
+            p.refresh(msg); tree = p.tree; before = p.surfaces.copy()
+            p.refresh(msg)
+            self.assertIs(tree, p.tree)
+            p.update(np.zeros(p.shape, dtype=np.int8))
+            p.refresh(msg)
+            self.assertTrue((p.raw == 100).any())
+            tr.x = .1
+            p.refresh(msg)
+            np.testing.assert_allclose(p.surfaces, before+[.1, 0.])
+            now[0] = 14.
+            with self.assertRaisesRegex(ValueError, 'stale'):
+                p.refresh(msg)
+
     def test_guarded_finish_checks_surfaces_and_requires_route(self):
         p = policy(PreciseDQN)
         start = np.array([1.5, 2.])
